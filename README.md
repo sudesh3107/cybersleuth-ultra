@@ -3,7 +3,6 @@
 > Advanced Multi-Source OSINT & Vulnerability Assessment Scanner
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
-![License](https://img.shields.io/badge/License-MIT-green)
 ![Version](https://img.shields.io/badge/Version-3.0-purple)
 
 ---
@@ -40,7 +39,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cybersleuth-ultra.git
+git clone https://github.com/sudesh3107/cybersleuth-ultra
 cd cybersleuth-ultra
 pip install -r requirements.txt
 ```
@@ -60,16 +59,16 @@ Free keys available at [shodan.io](https://shodan.io) and [virustotal.com](https
 
 ```bash
 # Basic scan
-python cybersleuth_ultra.py example.com
+python3 cybersleuth_ultra.py example.com
 
 # Full scan with top 100 ports, save JSON + HTML report
-python cybersleuth_ultra.py example.com --ports top100 --output report
+python3 cybersleuth_ultra.py example.com --ports top100 --output report
 
 # Scan an IP address
-python cybersleuth_ultra.py 93.184.216.34 --ports common
+python3 cybersleuth_ultra.py 93.184.216.34 --ports common
 
 # Save JSON only
-python cybersleuth_ultra.py example.com --output results --json-only
+python3 cybersleuth_ultra.py example.com --output results --json-only
 ```
 
 ### Arguments
@@ -146,6 +145,3 @@ The authors assume no liability for misuse.
 
 ---
 
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
