@@ -84,7 +84,17 @@ sqlmap -u "http://192.168.1.100/?id=1" --batch --dbs
 # 4. Or run Nikto
 nikto -h 192.168.1.100 -p 80 -C all -output nikto_report.html
 ```
-## Tools
+---
+
+## Requirements
+
+- Python 3.10+
+- See `requirements.txt` for full dependency list
+
+Core dependencies: `requests`, `rich`, `dnspython`  
+Optional (for full functionality): `python-whois`, `shodan`, `builtwith`, `beautifulsoup4`
+
+### Tools
 > PKG manager tools required
 ```bash
   git \
@@ -138,6 +148,8 @@ python3 -c "import rich, requests, dns; print('✓ Core packages OK')"
 python3 -c "import shodan; print('✓ shodan OK')"
 python3 -c "import bs4; print('✓ beautifulsoup4 OK')"
 ```
+---
+
 ### Arguments
 
 | Argument | Description |
@@ -170,15 +182,6 @@ Vulnerabilities: 2 Critical  |  4 High  |  6 Medium  |  3 Low
 
 ---
 
-## Requirements
-
-- Python 3.10+
-- See `requirements.txt` for full dependency list
-
-Core dependencies: `requests`, `rich`, `dnspython`  
-Optional (for full functionality): `python-whois`, `shodan`, `builtwith`, `beautifulsoup4`
-
----
 
 ## Vulnerability Checks
 
