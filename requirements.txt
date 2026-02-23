@@ -1,0 +1,15 @@
+# CyberSleuth Ultra v3.0 — Requirements
+# Install with: pip install -r requirements.txt
+
+# ── Core (Required) ──────────────────────────────────
+requests>=2.31.0
+rich>=13.7.0
+dnspython>=2.6.0
+
+# ── Enhanced Features (Recommended) ──────────────────
+python-whois>=0.9.4        # WHOIS lookups
+shodan>=1.31.0             # Shodan intelligence (needs API key)
+builtwith>=1.3.16          # Technology fingerprinting
+beautifulsoup4>=4.12.0     # HTML parsing for contact harvesting
+pyOpenSSL>=24.0.0          # Advanced SSL/TLS analysis
+lxml>=5.1.0                # Fast HTML/XML parser (bs4 backend)
