@@ -70,7 +70,74 @@ python3 cybersleuth_ultra.py 93.184.216.34 --ports common
 # Save JSON only
 python3 cybersleuth_ultra.py example.com --output results --json-only
 ```
+## Usage with exploit_integration
+```bash
+# 1. Feed the scan results into the exploit integration module
+python3 exploit_integration.py --scan my_scan.json --output exploit_plan
 
+# 2. Launch the auto-generated Metasploit script
+msfconsole -r exploit_plan.rc
+
+# 3. Or run SQLMap directly
+sqlmap -u "http://192.168.1.100/?id=1" --batch --dbs
+
+# 4. Or run Nikto
+nikto -h 192.168.1.100 -p 80 -C all -output nikto_report.html
+```
+## Tools
+> PKG manager tools required
+```bash
+  git \
+  python3 \
+  python3-pip \
+  nmap \
+  netcat \
+  whois \
+  curl \
+  wget \
+  hydra \
+  nikto \
+  redis \
+  mongodb-org-shell \
+  postgresql \
+  mysql \
+  openssl \
+  smbclient \
+  enum4linux \
+  john \
+  aircrack-ng\
+  sqlmap\
+  metasploit-framework\
+
+```
+> pip Tools
+```bash
+pip install \
+  requests \
+  rich \
+  dnspython \
+  python-whois \
+  shodan \
+  builtwith \
+  beautifulsoup4 \
+  pyOpenSSL \
+  lxml \
+  git-dumper
+```
+> Verify Installed Tools
+```bash
+echo "--- System Tools ---"
+which nmap hydra sqlmap && echo "✓ nmap, hydra, sqlmap"
+nikto -Version 2>&1 | head -1 && echo "✓ nikto"
+msfconsole --version && echo "✓ metasploit"
+mysql --version && echo "✓ mariadb/mysql"
+mongosh --version && echo "✓ mongosh"
+
+echo "--- Python Packages ---"
+python3 -c "import rich, requests, dns; print('✓ Core packages OK')"
+python3 -c "import shodan; print('✓ shodan OK')"
+python3 -c "import bs4; print('✓ beautifulsoup4 OK')"
+```
 ### Arguments
 
 | Argument | Description |
