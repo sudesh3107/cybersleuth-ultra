@@ -9,7 +9,7 @@ dnspython>=2.6.0
 # ── Enhanced Features (Recommended) ──────────────────
 python-whois>=0.9.4        # WHOIS lookups
 shodan>=1.31.0             # Shodan intelligence (needs API key)
-builtwith>=1.3.16          # Technology fingerprinting
+builtwith>=1.3.4           # Technology fingerprinting
 beautifulsoup4>=4.12.0     # HTML parsing for contact harvesting
 pyOpenSSL>=24.0.0          # Advanced SSL/TLS analysis
 lxml>=5.1.0                # Fast HTML/XML parser (bs4 backend)
