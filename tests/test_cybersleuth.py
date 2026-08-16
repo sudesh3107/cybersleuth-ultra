@@ -222,6 +222,36 @@ Allow: /public
         assert cs.parse_robots_disallow("Disallow: /\n") == []
 
 
+# ── Missing headers are hardening, not vulnerabilities ─────────
+
+class TestHeaderPosture:
+    def test_missing_headers_not_counted_as_vulns(self):
+        res = ScanResults(target="example.com")
+        res.security_headers = {
+            "Strict-Transport-Security": {"present": False, "value": "", "secure": False},
+            "Content-Security-Policy":   {"present": False, "value": "", "secure": False},
+        }
+        eng = VulnerabilityEngine(res, session=None)
+        eng.r.spf_record = "v=spf1 -all"
+        eng.r.dmarc_record = "v=DMARC1; p=reject"
+        out = eng.run_all()
+        assert not any("Security Header" in v.name for v in out)
+        names = [h["name"] for h in res.hardening_recommendations]
+        assert "Missing Security Header: Strict-Transport-Security" in names
+        assert all(h["severity"] == "Info" for h in res.hardening_recommendations)
+
+    def test_present_secure_header_produces_no_recommendation(self):
+        res = ScanResults(target="example.com")
+        res.security_headers = {
+            "Strict-Transport-Security": {"present": True, "value": "max-age=31536000", "secure": True},
+        }
+        eng = VulnerabilityEngine(res, session=None)
+        eng.r.spf_record = "v=spf1 -all"
+        eng.r.dmarc_record = "v=DMARC1; p=reject"
+        eng.run_all()
+        assert res.hardening_recommendations == []
+
+
 # ── JSON schema stability (exploit_integration depends on it) ──
 
 class TestJsonSchema:

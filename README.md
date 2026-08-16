@@ -1,15 +1,22 @@
-# 🔍 CyberSleuth Ultra v4.0
+# 🔍 CyberSleuth Ultra v4.1
 
 > Advanced Multi-Source OSINT & Vulnerability Assessment Scanner
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
-![Version](https://img.shields.io/badge/Version-4.0-purple)
+![Version](https://img.shields.io/badge/Version-4.1-purple)
 
 ---
 
 ⚠️ **For authorized security testing only. Never scan targets without explicit written permission.**
 
 ---
+
+## What changed in v4.1
+
+Missing security headers are **hardening recommendations, not vulnerabilities**.
+They no longer inflate the Critical/High/Medium/Low counts — the vulnerability list
+contains only exploitable issues, and header gaps are reported separately under
+`Hardening Recommendations` (severity `Info`, included in JSON + HTML reports).
 
 ## What changed in v4.0
 
@@ -171,7 +178,6 @@ Vulnerabilities: 2 Critical  |  4 High  |  6 Medium  |  3 Low
 - Environment file (`.env`) disclosure (KEY=VALUE content verified — no HTML false positives)
 - Directory listing enabled
 - CORS misconfiguration (wildcard, reflection, credential-wildcard)
-- Missing security headers (HSTS, CSP, X-Frame-Options, COEP, COOP, etc.)
 - SSL/TLS issues (expired, self-signed, weak ciphers, old TLS versions)
 - Dangerous services exposed (Redis, MongoDB, Elasticsearch, RDP, etc.)
 - Insecure cookie flags
@@ -184,6 +190,10 @@ Vulnerabilities: 2 Critical  |  4 High  |  6 Medium  |  3 Low
 - Shodan-reported CVEs
 - VirusTotal malicious reputation
 - Subdomain takeover candidates
+
+> Missing security headers (HSTS, CSP, X-Frame-Options, COEP, COOP, etc.) are
+> reported as **hardening recommendations** (Info severity) rather than
+> vulnerabilities — they are posture gaps, not exploitable issues.
 
 ---
 

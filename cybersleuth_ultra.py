@@ -110,7 +110,7 @@ console = Console(highlight=True)
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 log = logging.getLogger("cybersleuth")
 
-VERSION = "4.0"
+VERSION = "4.1"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -186,6 +186,7 @@ class ScanResults:
     virustotal_data: dict = field(default_factory=dict)
     subdomain_takeover: list = field(default_factory=list)
     vulnerabilities: list = field(default_factory=list)
+    hardening_recommendations: list = field(default_factory=list)
     scan_metadata: dict = field(default_factory=dict)
 
 
@@ -1703,6 +1704,9 @@ class VulnerabilityEngine:
                 continue
 
     def check_security_headers(self):
+        """Missing headers are hardening gaps, NOT vulnerabilities.
+        They are collected into results.hardening_recommendations so the
+        vulnerability counts only contain exploitable issues."""
         for header, audit_dict in self.r.security_headers.items():
             if not audit_dict.get("present"):
                 sev_map = {
@@ -1718,15 +1722,15 @@ class VulnerabilityEngine:
                 if header in sev_map:
                     sev, cvss = sev_map[header]
                     meta = HTTPHeaderScanner.SECURITY_HEADERS[header]
-                    self._add(
+                    self.r.hardening_recommendations.append(asdict(Vulnerability(
                         name=f"Missing Security Header: {header}",
-                        severity=sev,
+                        severity="Info",
                         cvss=cvss,
                         description=f"The {header} security header is absent. {meta['desc']}.",
-                        evidence=f"Header not present in HTTP response",
+                        evidence="Header not present in HTTP response",
                         remediation=f"Add the {header} header to all HTTP responses from your web server.",
                         cwe="CWE-693",
-                    )
+                    )))
 
     def check_ssl_issues(self):
         ssl = self.r.ssl_info
@@ -2068,6 +2072,16 @@ class VulnerabilityEngine:
 
         self._dedupe()
         self.vulns.sort(key=lambda v: v.cvss, reverse=True)
+
+        seen_h = set()
+        harden = []
+        for h in self.r.hardening_recommendations:
+            if h["name"] not in seen_h:
+                seen_h.add(h["name"])
+                harden.append(h)
+        harden.sort(key=lambda h: h.get("cvss", 0), reverse=True)
+        self.r.hardening_recommendations = harden
+
         return self.vulns
 
 
@@ -2265,6 +2279,7 @@ class CyberSleuthUltra:
             "passive":               Config.PASSIVE_MODE,
             "quick":                 Config.QUICK_MODE,
             "total_checks":          len(engine.vulns),
+            "hardening_count":       len(self.results.hardening_recommendations),
         }
 
         return self.results
@@ -2338,6 +2353,16 @@ class Reporter:
                     title=f"[{color}]  {i}. {vuln['name']}[/]",
                     border_style=color.replace("bold ", ""),
                 ))
+
+        # ── Hardening Recommendations (NOT vulnerabilities) ────
+        if results.hardening_recommendations:
+            c.print(Rule("[bold cyan]HARDENING RECOMMENDATIONS[/] (informational)", style="dim"))
+            for h in results.hardening_recommendations:
+                c.print(
+                    f"  [dim]• [bold]{h['name']}[/] — {h['description']} "
+                    f"[green]Fix: {h['remediation']}[/]"
+                )
+            c.print("[dim]  These are posture improvements, not exploitable vulnerabilities.[/]")
 
         # ── DNS Records ───────────────────────────────────────
         if results.dns_records:
@@ -2498,6 +2523,7 @@ class Reporter:
         c.print(
             f"[dim]Scan completed in [bold]{meta.get('scan_duration_seconds','?')}s[/] "
             f"| {total} vulnerabilities found "
+            f"| {meta.get('hardening_count', 0)} hardening recommendations "
             f"| {len(results.open_ports)} open ports "
             f"| {len(results.subdomains)} subdomains[/]"
         )
@@ -2733,6 +2759,17 @@ class Reporter:
 
 <h2>Vulnerabilities ({len(results.vulnerabilities)} Found)</h2>
 {vulns_html if vulns_html else '<p style="color:var(--dim)">No vulnerabilities detected.</p>'}
+
+<h2>Hardening Recommendations ({len(results.hardening_recommendations)})</h2>
+<p class="meta">Informational posture improvements — not exploitable vulnerabilities.</p>
+{"".join(
+    f'<div class="vuln"><div class="vuln-header" style="border-left: 5px solid #636366;">'
+    f'<span class="badge" style="background:#636366;color:#fff">Info</span>'
+    f'<strong>{esc(h["name"])}</strong><span class="cvss">CVSS {h.get("cvss",0):.1f}</span></div>'
+    f'<div class="vuln-body"><p>{esc(h["description"])}</p>'
+    f'<p><span class="fix">Fix: {esc(h["remediation"])}</span></p></div></div>'
+    for h in results.hardening_recommendations
+) or '<p style="color:var(--dim)">No hardening recommendations.</p>'}
 
 <h2>Open Ports ({len(results.open_ports)})</h2>
 <table>
