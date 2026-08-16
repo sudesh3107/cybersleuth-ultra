@@ -2,21 +2,34 @@
 """
 ╔═══════════════════════════════════════════════════════════════╗
 ║          CyberSleuth Ultra - Advanced OSINT & VA Scanner      ║
-║   Version 3.0 | Author: github.com/sudesh3107/cybersleuth     ║
+║   Version 4.0 | Author: github.com/sudesh3107/cybersleuth     ║
 ║  ⚠  FOR AUTHORIZED SECURITY TESTING ONLY - USE RESPONSIBLY   ║
 ╚═══════════════════════════════════════════════════════════════╝
+
+v4.0 changes over v3.0
+  * REAL TLS banner grabbing (v3 returned the literal string "[HTTPS]")
+  * Sensitive-file discovery now verifies file CONTENT (v3 flagged any
+    server that answers HEAD 200, and treated "=" in a body as an .env leak)
+  * .git / .env / WAF checks now try BOTH http and https (v3 only did http)
+  * IPv6-safe ASN lookup (v3 crashed on IPv6 addresses)
+  * New: Wayback Machine passive subdomain source, DNS wildcard detection
+  * New: HTTP TRACE (XST) and Open Redirect checks in the vuln engine
+  * New: robots.txt Disallow entries are folded into file discovery
+  * New: --passive / --quick / --threads / --timeout / --max-subdomains
+  * New: full HTML report (DNS, headers, WAF, tech, email sec, ASN, ...)
+  * New: CSV export, vuln de-duplication, XSS-safe HTML escaping
 """
 
 import os
-import sys
 import re
 import ssl
+import csv
 import json
 import time
+import html
 import socket
-import asyncio
+import random
 import logging
-import hashlib
 import ipaddress
 import argparse
 import threading
@@ -41,14 +54,10 @@ try:
     from rich.table import Table
     from rich.panel import Panel
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-    from rich.live import Live
-    from rich.layout import Layout
     from rich.text import Text
     from rich import box
     from rich.rule import Rule
     from rich.tree import Tree
-    from rich.columns import Columns
-    from rich.align import Align
 except ImportError:
     sys.exit("[!] Missing: pip install rich")
 
@@ -92,6 +101,7 @@ try:
 except ImportError:
     OPENSSL_AVAILABLE = False
 
+import sys
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -99,6 +109,8 @@ warnings.filterwarnings("ignore")
 console = Console(highlight=True)
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 log = logging.getLogger("cybersleuth")
+
+VERSION = "4.0"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -154,6 +166,7 @@ class ScanResults:
     rdap_info: dict = field(default_factory=dict)
     dns_records: dict = field(default_factory=dict)
     subdomains: list = field(default_factory=list)
+    wildcard_dns: bool = False
     open_ports: list = field(default_factory=list)
     ssl_info: dict = field(default_factory=dict)
     http_headers: dict = field(default_factory=dict)
@@ -189,13 +202,16 @@ class Config:
 
     USER_AGENT: str    = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
     TIMEOUT: int       = 8
-    MAX_WORKERS: int   = 30          # Controlled concurrency (not cpu*2 everywhere)
+    MAX_WORKERS: int   = 30          # Controlled concurrency
     MAX_RETRIES: int   = 2
     RATE_LIMIT_DELAY: float = 0.05   # Seconds between requests per host
-    VERIFY_SSL: bool   = False        # Skip SSL verification for targets (intentional)
+    VERIFY_SSL: bool   = False       # Skip SSL verification for targets (intentional)
     FOLLOW_REDIRECTS: bool = True
     MAX_CRAWL_DEPTH: int = 2
     MAX_CRAWL_PAGES: int = 20
+    PASSIVE_MODE: bool = False
+    QUICK_MODE: bool = False
+    MAX_SUBDOMAINS_CHECK: int = 100
 
     # Port lists
     TOP_100_PORTS = [
@@ -231,6 +247,8 @@ class Config:
         "tracking", "metrics", "monitoring", "status", "health",
     ]
 
+    # ── Sensitive file discovery ───────────────────────────────
+    # Tier A: verified with GET + content check (accurate, no false positives)
     SENSITIVE_FILES = [
         # Config files
         ".env", ".env.local", ".env.production", ".env.backup",
@@ -264,6 +282,42 @@ class Config:
         "laravel.log", "application.log",
     ]
 
+    # High-signal paths whose GET response body must match a verifier.
+    # Anything not listed here uses HEAD + content-type heuristics.
+    SENSITIVE_VERIFIERS = {
+        ".git/HEAD":          lambda b: b.strip().startswith("ref:"),
+        ".git/config":        lambda b: "[core]" in b,
+        ".git/COMMIT_EDITMSG":lambda b: len(b.strip()) > 0 and not is_html(b),
+        ".env":               lambda b: looks_like_env(b),
+        ".env.local":         lambda b: looks_like_env(b),
+        ".env.production":    lambda b: looks_like_env(b),
+        ".env.backup":        lambda b: looks_like_env(b),
+        ".htpasswd":          lambda b: re.search(r"^[^:#]+:[^\s:]+$", b, re.M) is not None,
+        ".htaccess":          lambda b: re.search(r"RewriteEngine|RewriteRule|Options\s|\bAllow\b|\bDeny\b", b, re.I) is not None,
+        "phpinfo.php":        lambda b: "phpinfo()" in b.lower(),
+        "info.php":           lambda b: "phpinfo()" in b.lower(),
+        "wp-config.php":      lambda b: "DB_NAME" in b or "DB_HOST" in b,
+        "configuration.php":  lambda b: "<?php" in b,
+        "settings.php":       lambda b: "<?php" in b,
+        "settings.py":        lambda b: re.search(r"=\s*['\"]", b) is not None,
+        "database.yml":       lambda b: "adapter" in b.lower() and "password" in b.lower(),
+        "application.properties": lambda b: re.search(r"^[A-Za-z0-9_.-]+\s*=\s*\S", b, re.M) is not None,
+        "web.config":         lambda b: "<configuration" in b.lower(),
+        ".svn/entries":       lambda b: b.strip().startswith("10") or "dir" in b.lower(),
+        ".hg/hgrc":           lambda b: "[paths]" in b or "[web]" in b,
+        "composer.json":      lambda b: b.lstrip().startswith("{"),
+        "package.json":       lambda b: b.lstrip().startswith("{"),
+        "credentials.txt":    lambda b: ":" in b,
+        "credentials.json":   lambda b: b.lstrip().startswith("{"),
+        "secrets.json":       lambda b: b.lstrip().startswith("{"),
+        "password.txt":       lambda b: ":" in b or re.search(r"\w+\s+\w+", b),
+        "passwords.txt":      lambda b: ":" in b,
+    }
+
+    # Paths validated with GET when the response body is empty/short.
+    SENSITIVE_VERIFIERS_STRICT = set(SENSITIVE_VERIFIERS.keys())
+
+    # Skip-path blacklist: never run brute force on these admin dirs
     ADMIN_PATHS = [
         "admin", "admin/", "admin/login", "admin/index.php",
         "administrator", "administrator/", "wp-admin", "wp-login.php",
@@ -287,6 +341,9 @@ class Config:
         "Barracuda":  ["barracuda_", "barra_counter_session"],
         "Nginx":      ["x-nginx-proxy"],
         "Wordfence":  ["wordfence"],
+        "Citrix":     ["citrix_ns_id", "nsc_aaac"],
+        "StackPath":  ["x-stackpath"],
+        "Squarespace":["squarespace"],
     }
 
     TAKEOVER_FINGERPRINTS = {
@@ -309,51 +366,64 @@ class Config:
         "HelpScout":          "No settings were found for this company",
         "UserVoice":          "This UserVoice subdomain is currently available",
         "Zendesk":            "Help Center Closed",
+        "Flywheel":           "is no longer configured",
+        "OVH":                "The domain is not configured",
+        "UptimeRobot":        "is not compatible with the configured integration",
+        "Surge.sh":           "project not found",
+        "Campaign Monitor":   "This domain is not configured",
+        "GetResponse":        "Your account has been suspended",
+        "Tictail":            "that store is no longer in service",
+        "SmugMug":            "Domain not found",
+        "Webflow":            "There is no content here",
+        "Cargo Collective":   "If you're moving your domain away from Cargo",
+        "Strikingly":         "This page is under construction",
+        "Airee":              "does not exist",
+        "Blogger":            "The blog you were looking for does not exist",
     }
 
-
-# ═══════════════════════════════════════════════════════════════
-# HTTP SESSION FACTORY  (retry + rate-limiter built in)
-# ═══════════════════════════════════════════════════════════════
-
-class RateLimiter:
-    """Per-host token-bucket rate limiter."""
-    def __init__(self, rate: float = Config.RATE_LIMIT_DELAY):
-        self._rate = rate
-        self._last: dict = defaultdict(float)
-        self._lock = threading.Lock()
-
-    def wait(self, host: str):
-        with self._lock:
-            elapsed = time.monotonic() - self._last[host]
-            if elapsed < self._rate:
-                time.sleep(self._rate - elapsed)
-            self._last[host] = time.monotonic()
-
-
-_rate_limiter = RateLimiter()
-
-
-def build_session(retries: int = Config.MAX_RETRIES) -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        backoff_factor=0.4,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET"],
-        raise_on_status=False,
-    )
-    adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_maxsize=50)
-    session.mount("http://",  adapter)
-    session.mount("https://", adapter)
-    session.headers["User-Agent"] = Config.USER_AGENT
-    session.verify = Config.VERIFY_SSL
-    return session
+    # Open-redirect test payloads + endpoint hints
+    REDIRECT_PAYLOADS = [
+        "//evil.attacker.invalid",
+        "https://evil.attacker.invalid",
+        "/\\/evil.attacker.invalid",
+    ]
+    REDIRECT_PATHS = ["/", "/redirect", "/r", "/goto", "/url", "/out", "/link", "/return"]
 
 
 # ═══════════════════════════════════════════════════════════════
-# HELPER UTILITIES
+# HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
+
+def is_html(body: str) -> bool:
+    """Crude HTML detector used to avoid soft-404 / directory-page false positives."""
+    if not body:
+        return False
+    head = body[:500].lstrip().lower()
+    return head.startswith("<") and ("<html" in head or "<!doctype" in head or "<div" in head or "<head" in head)
+
+
+def looks_like_env(body: str) -> bool:
+    """An .env file contains KEY=VALUE lines. '=' alone in an HTML page is NOT a leak."""
+    if is_html(body):
+        return False
+    hits = [m for m in re.finditer(r"(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\S.*)$", body, re.M)]
+    if not hits:
+        return False
+    names = [m.group(1) for m in hits]
+    hints = ("DB_", "PASSWORD", "SECRET", "API_", "TOKEN", "AWS_", "KEY", "HOST", "PORT", "USER", "MAIL", "SMTP", "CLIENT", "URL")
+    strong = any(any(h in n.upper() for h in hints) for n in names)
+    return strong or len(hits) >= 3
+
+
+def soft_404(body: str, content_type: str) -> bool:
+    """Heuristic: HTML error pages that echo '404 / not found' are soft 404s."""
+    if not body or "html" not in (content_type or "").lower():
+        return False
+    if re.search(r"404\s*not\s*found|page\s*not\s*found|no\s*such\s*(file|page)|resource\s*not\s*found|does\s*not\s*exist",
+                 body[:4000], re.I):
+        return True
+    return False
+
 
 def is_valid_ip(address: str) -> bool:
     try:
@@ -407,6 +477,49 @@ def retry(times=2, delay=0.3):
         return wrapper
     return decorator
 
+def esc(value) -> str:
+    """XSS-safe escape for HTML report interpolation."""
+    return html.escape(str(value or ""), quote=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# HTTP SESSION FACTORY  (retry + rate-limiter built in)
+# ═══════════════════════════════════════════════════════════════
+
+class RateLimiter:
+    """Per-host token-bucket rate limiter."""
+    def __init__(self, rate: float = Config.RATE_LIMIT_DELAY):
+        self._rate = rate
+        self._last: dict = defaultdict(float)
+        self._lock = threading.Lock()
+
+    def wait(self, host: str):
+        with self._lock:
+            elapsed = time.monotonic() - self._last[host]
+            if elapsed < self._rate:
+                time.sleep(self._rate - elapsed)
+            self._last[host] = time.monotonic()
+
+
+_rate_limiter = RateLimiter()
+
+
+def build_session(retries: int = Config.MAX_RETRIES) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=0.4,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET"],
+        raise_on_status=False,
+    )
+    adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_maxsize=50)
+    session.mount("http://",  adapter)
+    session.mount("https://", adapter)
+    session.headers["User-Agent"] = Config.USER_AGENT
+    session.verify = Config.VERIFY_SSL
+    return session
+
 
 # ═══════════════════════════════════════════════════════════════
 # INDIVIDUAL SCANNER MODULES
@@ -427,14 +540,21 @@ class IPResolver:
 
 
 class ASNLookup:
-    """Retrieve ASN/BGP info from Team Cymru."""
+    """Retrieve ASN/BGP info from Team Cymru (IPv4 + IPv6)."""
     @staticmethod
     @retry(times=2)
     def lookup(ip: str) -> dict:
         try:
+            addr = ipaddress.ip_address(ip)
             resolver = dns.resolver.Resolver()
-            reversed_ip = ".".join(reversed(ip.split(".")))
-            ans = resolver.resolve(f"{reversed_ip}.origin.asn.cymru.com", "TXT")
+            if addr.version == 4:
+                reversed_ip = ".".join(reversed(ip.split(".")))
+                zone = "origin.asn.cymru.com"
+            else:
+                # IPv6: nibble-reversed hex
+                reversed_ip = ".".join(list(addr.exploded.replace(":", ""))[::-1])
+                zone = "origin6.asn.cymru.com"
+            ans = resolver.resolve(f"{reversed_ip}.{zone}", "TXT")
             raw = str(ans[0]).strip('"')
             parts = [p.strip() for p in raw.split("|")]
             asn_result = {
@@ -444,7 +564,6 @@ class ASNLookup:
                 "rir":    parts[3] if len(parts) > 3 else "",
                 "date":   parts[4] if len(parts) > 4 else "",
             }
-            # Resolve ASN description
             try:
                 asn_num = asn_result["asn"].replace("AS", "").strip()
                 desc_ans = resolver.resolve(f"AS{asn_num}.asn.cymru.com", "TXT")
@@ -505,13 +624,12 @@ class RDAPScanner:
                 }
                 for event in data.get("events", []):
                     result[f"event_{event.get('eventAction','').replace(' ','_')}"] = event.get("eventDate", "")
-                # Extract entities
                 for entity in data.get("entities", []):
                     roles = entity.get("roles", [])
                     vcards = entity.get("vcardArray", [])
                     if vcards and len(vcards) > 1:
                         for vcard in vcards[1]:
-                            if vcard[0] == "fn":
+                            if vcard and len(vcard) > 3 and vcard[0] == "fn":
                                 result[f"entity_{'_'.join(roles)}_name"] = vcard[3]
                 return result
         except Exception:
@@ -532,19 +650,14 @@ class DNSScanner:
 
         for rtype in DNSScanner.RECORD_TYPES:
             try:
-                lookup = target if not is_valid_ip(target) else str(dns.reversename.from_address(target))
-                if is_valid_ip(target) and rtype != "PTR":
+                if is_valid_ip(target):
+                    if rtype != "PTR":
+                        continue
+                    rev = dns.reversename.from_address(target)
+                    answers = resolver.resolve(rev, "PTR")
+                    records["PTR"] = [str(r) for r in answers]
                     continue
-                if rtype == "PTR" and not is_valid_ip(target):
-                    # Forward PTR from IP
-                    try:
-                        rev = dns.reversename.from_address(ip)
-                        answers = resolver.resolve(rev, "PTR")
-                        records["PTR"] = [str(r) for r in answers]
-                    except Exception:
-                        pass
-                    continue
-                answers = resolver.resolve(lookup, rtype)
+                answers = resolver.resolve(target, rtype)
                 records[rtype] = [str(r) for r in answers]
             except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout):
                 pass
@@ -566,6 +679,17 @@ class DNSScanner:
                     pass
 
         return records
+
+    @staticmethod
+    def detect_wildcard(target: str) -> bool:
+        """Returns True if the zone resolves a random subdomain (wildcard DNS)."""
+        try:
+            probe = f"cybsleuthx{random.randint(100000, 999999)}.{target}"
+            socket.setdefaulttimeout(3)
+            socket.gethostbyname(probe)
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def check_email_security(target: str) -> tuple[str, str, str]:
@@ -594,15 +718,35 @@ class DNSScanner:
 
 
 class SubdomainScanner:
-    """Multi-source subdomain enumeration."""
+    """Multi-source subdomain enumeration (active brute-force + passive sources)."""
 
-    def __init__(self, target: str, session: requests.Session):
+    HOSTNAME_RE = re.compile(
+        r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+        r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+    )
+
+    def __init__(self, target: str, session: requests.Session, allow_brute: bool = True):
         self.target = target
         self.session = session
         self.found: set[str] = set()
+        self.wildcard = False
+        self.allow_brute = allow_brute
+
+    @staticmethod
+    def _valid_subdomain(name: str, target: str) -> bool:
+        """Passive sources return junk (emails, CN strings, wildcards) — filter it."""
+        name = (name or "").strip().lower()
+        if not name or name == target or not name.endswith("." + target):
+            return False
+        if any(ch in name for ch in ("@", "*", " ", "/", "\\", ":")):
+            return False
+        return bool(SubdomainScanner.HOSTNAME_RE.match(name))
 
     def brute_force(self) -> set:
         found = set()
+        if self.wildcard:
+            log.info("Wildcard DNS detected — skipping brute force (results would be noise).")
+            return found
         def check(sub):
             fqdn = f"{sub}.{self.target}"
             try:
@@ -611,7 +755,6 @@ class SubdomainScanner:
                 return fqdn
             except Exception:
                 return None
-
         with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as pool:
             for result in pool.map(check, Config.SUBDOMAIN_WORDLIST):
                 if result:
@@ -624,14 +767,14 @@ class SubdomainScanner:
         try:
             r = self.session.get(
                 f"https://crt.sh/?q=%.{self.target}&output=json",
-                timeout=15
+                timeout=20
             )
             if r.status_code == 200:
                 for entry in r.json():
                     name = entry.get("name_value", "")
                     for n in name.split("\n"):
                         n = n.strip().lower().lstrip("*.")
-                        if n.endswith(self.target) and n != self.target:
+                        if SubdomainScanner._valid_subdomain(n, self.target):
                             found.add(n)
         except Exception:
             pass
@@ -650,23 +793,45 @@ class SubdomainScanner:
                     parts = line.split(",")
                     if parts:
                         sub = parts[0].strip()
-                        if sub.endswith(self.target):
+                        if SubdomainScanner._valid_subdomain(sub, self.target):
                             found.add(sub)
         except Exception:
             pass
         return found
 
-    def scan(self) -> list[dict]:
+    def wayback_machine(self) -> set:
+        """Passive: extract hostnames from the Internet Archive CDX index."""
+        found = set()
+        try:
+            url = ("https://web.archive.org/cdx/search/cdx?"
+                   f"url={self.target}/*&output=json&fl=original&collapse=urlkey&limit=1000")
+            r = self.session.get(url, timeout=20)
+            if r.status_code == 200:
+                rows = r.json()
+                for row in rows[1:]:
+                    try:
+                        host = (urlparse(row[0]).hostname or "").lower()
+                    except Exception:
+                        continue
+                    if SubdomainScanner._valid_subdomain(host, self.target):
+                        found.add(host)
+        except Exception:
+            pass
+        return found
+
+    def scan(self) -> tuple[list[dict], bool]:
         all_subs: set[str] = set()
 
-        # Run sources in parallel
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f_brute = pool.submit(self.brute_force)
-            f_crt   = pool.submit(self.certificate_transparency)
-            f_ht    = pool.submit(self.hackertarget_api)
-            all_subs |= f_brute.result()
-            all_subs |= f_crt.result()
-            all_subs |= f_ht.result()
+        self.wildcard = DNSScanner.detect_wildcard(self.target)
+
+        sources = [self.certificate_transparency, self.hackertarget_api, self.wayback_machine]
+        if self.allow_brute:
+            sources.append(self.brute_force)
+
+        with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+            futures = [pool.submit(src) for src in sources]
+            for f in futures:
+                all_subs |= f.result() or set()
 
         results = []
         for sub in sorted(all_subs):
@@ -676,7 +841,7 @@ class SubdomainScanner:
             except Exception:
                 results.append({"subdomain": sub, "ip": "unresolvable", "private": False})
 
-        return results
+        return results, self.wildcard
 
 
 class PortScanner:
@@ -687,7 +852,7 @@ class PortScanner:
         111: "RPC",       119: "NNTP",      135: "MSRPC",     139: "NetBIOS-SSN",
         143: "IMAP",      161: "SNMP",      162: "SNMP-Trap", 194: "IRC",
         389: "LDAP",      443: "HTTPS",     445: "SMB",       465: "SMTPS",
-        587: "Submission",636: "LDAPS",      993: "IMAPS",     995: "POP3S",
+        587: "Submission",636: "LDAPS",     993: "IMAPS",     995: "POP3S",
         1080: "SOCKS",    1194: "OpenVPN",  1433: "MSSQL",    1521: "Oracle",
         1723: "PPTP",     2049: "NFS",      2181: "ZooKeeper",3000: "Dev-HTTP",
         3306: "MySQL",    3389: "RDP",      3690: "SVN",      4443: "HTTPS-Alt",
@@ -723,15 +888,18 @@ class PortScanner:
         61616: ("ActiveMQ",    "Message broker; remote code execution risks"),
     }
 
+    TLS_PORTS = {443, 4443, 8443, 9443, 7443, 6443}
+    HTTP_PORTS = {80, 81, 8080, 8000, 8001, 8008, 8081, 8082, 8088, 8090, 8888}
+
     @staticmethod
-    def scan_port(ip: str, port: int, timeout: float = 1.0) -> Optional[PortInfo]:
+    def scan_port(ip: str, port: int, timeout: float = 1.0, host: str = "") -> Optional[PortInfo]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         try:
             result = sock.connect_ex((ip, port))
             if result == 0:
                 service = PortScanner.SERVICE_MAP.get(port, "unknown")
-                banner = PortScanner._grab_banner(sock, port)
+                banner = PortScanner._grab_banner(sock, port, host or ip)
                 return PortInfo(
                     port=port,
                     protocol="tcp",
@@ -746,26 +914,66 @@ class PortScanner:
         return None
 
     @staticmethod
-    def _grab_banner(sock: socket.socket, port: int) -> str:
-        """Attempt to grab service banner."""
+    def _grab_banner(sock: socket.socket, port: int, host: str) -> str:
+        """Real banner grab: TLS handshake for TLS ports, HTTP request for web ports,
+        generic probe otherwise. v3 returned the literal string '[HTTPS]' — that was fake."""
         try:
-            # Send HTTP probe for web ports
-            if port in (80, 8080, 8000, 8008, 8081, 8088):
-                sock.send(b"HEAD / HTTP/1.0\r\n\r\n")
-            elif port in (443, 8443, 4443, 9443):
-                return "[HTTPS]"
+            if port in PortScanner.TLS_PORTS:
+                return PortScanner._grab_tls_banner(host, port)
+            if port in PortScanner.HTTP_PORTS:
+                req = (f"HEAD / HTTP/1.1\r\nHost: {host}\r\n"
+                       f"User-Agent: {Config.USER_AGENT}\r\nConnection: close\r\n\r\n")
+                sock.sendall(req.encode())
+                data = sock.recv(4096).decode("utf-8", errors="replace")
+                return PortScanner._http_summary(data)
+            if port == 25 or port == 587:
+                sock.sendall(b"EHLO cybersleuth\r\n")
+            elif port in (21, 110, 143, 993, 995, 22, 23):
+                sock.sendall(b"\r\n")
             else:
-                sock.send(b"\r\n")
+                sock.sendall(b"\r\n")
             banner = sock.recv(1024).decode("utf-8", errors="replace").strip()
             return banner[:200]
         except Exception:
             return ""
 
     @staticmethod
-    def scan(ip: str, port_list: list[int]) -> list[PortInfo]:
+    def _http_summary(raw: str) -> str:
+        """Extract status line + Server header from a raw HTTP response."""
+        status = raw.split("\r\n", 1)[0] if raw else ""
+        server = ""
+        for line in raw.split("\r\n"):
+            if line.lower().startswith("server:"):
+                server = line.split(":", 1)[1].strip()
+                break
+        if status and server:
+            return f"{status} | Server: {server}"[:200]
+        return status or raw[:200]
+
+    @staticmethod
+    def _grab_tls_banner(host: str, port: int) -> str:
+        """Do a real TLS handshake and pull the Server header over it."""
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=Config.TIMEOUT) as s:
+                with ctx.wrap_socket(s, server_hostname=host) as ts:
+                    tls_version = ts.version() or ""
+                    req = (f"HEAD / HTTP/1.1\r\nHost: {host}\r\n"
+                           f"User-Agent: {Config.USER_AGENT}\r\nConnection: close\r\n\r\n")
+                    ts.sendall(req.encode())
+                    raw = ts.recv(4096).decode("utf-8", errors="replace")
+                    summary = PortScanner._http_summary(raw)
+                    return f"[{tls_version}] {summary}".strip()[:200]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def scan(ip: str, port_list: list[int], host: str = "") -> list[PortInfo]:
         open_ports = []
         with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as pool:
-            futures = {pool.submit(PortScanner.scan_port, ip, p): p for p in port_list}
+            futures = {pool.submit(PortScanner.scan_port, ip, p, 1.0, host): p for p in port_list}
             for future in as_completed(futures):
                 result = future.result()
                 if result:
@@ -778,37 +986,23 @@ class SSLScanner:
     def scan(host: str, port: int = 443) -> SSLInfo:
         info = SSLInfo(valid=False)
         try:
-            ctx = ssl.create_default_context()
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             with socket.create_connection((host, port), timeout=Config.TIMEOUT) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                    cert = ssock.getpeercert()
                     info.tls_version = ssock.version() or ""
                     cipher = ssock.cipher()
                     info.weak_cipher = SSLScanner._is_weak_cipher(cipher[0] if cipher else "")
 
-                    if cert:
+                    # NOTE: with verify_mode=CERT_NONE, getpeercert() returns None,
+                    # so we grab the raw DER cert and parse it ourselves. The v3 code
+                    # called getpeercert() here and got None -> every HTTPS site was
+                    # falsely reported "SSL/TLS Certificate Invalid".
+                    cert_der = ssock.getpeercert(binary_form=True)
+                    if cert_der:
                         info.valid = True
-                        info.subject = dict(x[0] for x in cert.get("subject", []))
-                        info.issuer  = dict(x[0] for x in cert.get("issuer",  []))
-                        info.self_signed = info.subject == info.issuer
-
-                        not_after = cert.get("notAfter", "")
-                        if not_after:
-                            info.expiry = not_after
-                            try:
-                                exp = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                                exp = exp.replace(tzinfo=timezone.utc)
-                                info.days_remaining = (exp - datetime.now(timezone.utc)).days
-                            except Exception:
-                                pass
-
-                        # SANs
-                        san_list = cert.get("subjectAltName", [])
-                        info.san_domains = [v for t, v in san_list if t == "DNS"]
-
-                        # Grade heuristic
+                        SSLScanner._parse_cert(info, cert_der)
                         info.grade = SSLScanner._grade(info)
 
         except ssl.SSLError as e:
@@ -817,6 +1011,67 @@ class SSLScanner:
         except Exception:
             pass
         return info
+
+    @staticmethod
+    def _parse_cert(info: SSLInfo, cert_der: bytes):
+        pem = ssl.DER_cert_to_PEM_cert(cert_der)
+        if OPENSSL_AVAILABLE:
+            try:
+                x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, pem)
+                subject = dict(x509.get_subject().get_components())
+                issuer  = dict(x509.get_issuer().get_components())
+                info.subject = subject
+                info.issuer  = issuer
+                info.self_signed = subject == issuer
+                not_after = x509.get_notAfter().decode()
+                if not_after:
+                    info.expiry = not_after
+                    try:
+                        exp = datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
+                        exp = exp.replace(tzinfo=timezone.utc)
+                        info.days_remaining = (exp - datetime.now(timezone.utc)).days
+                    except Exception:
+                        pass
+                for ext in x509.get_extensions():
+                    if ext.get_short_name() == b"subjectAltName":
+                        value = str(ext)
+                        info.san_domains = re.findall(r"DNS:([^,]+)", value)
+                return
+            except Exception:
+                pass
+        # Fallback: CPython private decoder (best-effort, no extra deps)
+        try:
+            import tempfile
+            import ssl as _ssl_mod
+            with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as tf:
+                tf.write(pem)
+                tmp_path = tf.name
+            try:
+                cert = _ssl_mod._ssl._test_decode_cert(tmp_path)
+            except TypeError:
+                cert = _ssl_mod._ssl._test_decode_cert(pem)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            subject = dict(x[0] for x in cert.get("subject", []))
+            issuer  = dict(x[0] for x in cert.get("issuer",  []))
+            info.subject = subject
+            info.issuer  = issuer
+            info.self_signed = subject == issuer
+            not_after = cert.get("notAfter", "")
+            if not_after:
+                info.expiry = not_after
+                try:
+                    exp = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                    exp = exp.replace(tzinfo=timezone.utc)
+                    info.days_remaining = (exp - datetime.now(timezone.utc)).days
+                except Exception:
+                    pass
+            info.san_domains = [v for t, v in cert.get("subjectAltName", []) if t == "DNS"]
+        except Exception:
+            info.subject = {"note": "certificate parsed but details unavailable"}
 
     @staticmethod
     def _is_weak_cipher(cipher_name: str) -> bool:
@@ -919,30 +1174,29 @@ class WAFDetector:
     @staticmethod
     def detect(target: str, session: requests.Session) -> str:
         detected = []
-        try:
-            # Probe with XSS payload to trigger WAF
-            test_url = f"http://{target}/?test=<script>alert(1)</script>"
-            _rate_limiter.wait(target)
-            r = session.get(test_url, timeout=Config.TIMEOUT, allow_redirects=False)
-            headers_str = str(r.headers).lower()
-            body_str    = r.text.lower()
-            combined    = headers_str + body_str
+        for scheme in ("http", "https"):
+            try:
+                test_url = f"{scheme}://{target}/?test=<script>alert(1)</script>"
+                _rate_limiter.wait(target)
+                r = session.get(test_url, timeout=Config.TIMEOUT, allow_redirects=False)
+                headers_str = str(r.headers).lower()
+                body_str    = r.text.lower()
+                combined    = headers_str + body_str
 
-            for waf_name, signatures in Config.WAF_SIGNATURES.items():
-                if any(sig.lower() in combined for sig in signatures):
-                    detected.append(waf_name)
+                for waf_name, signatures in Config.WAF_SIGNATURES.items():
+                    if any(sig.lower() in combined for sig in signatures):
+                        detected.append(waf_name)
 
-            # Check for WAF-specific status codes
-            if r.status_code in (406, 419, 501, 999):
-                detected.append("Unknown WAF (blocked)")
-
-        except Exception:
-            pass
-        return ", ".join(detected) if detected else "None detected"
+                if r.status_code in (406, 419, 501, 999):
+                    detected.append("Unknown WAF (blocked)")
+                if detected:
+                    break
+            except Exception:
+                continue
+        return ", ".join(dict.fromkeys(detected)) if detected else "None detected"
 
 
 class TechFingerprinter:
-    # Header-based fingerprints
     SERVER_PATTERNS = {
         r"Apache/(\d+\.\d+)":       "Apache",
         r"nginx/(\d+\.\d+)":        "Nginx",
@@ -987,7 +1241,6 @@ class TechFingerprinter:
                 if val:
                     techs["frameworks"].append(extractor(val))
 
-            # Body-based detection
             body = r.text
             body_lower = body.lower()
             BODY_SIGS = {
@@ -1019,7 +1272,6 @@ class TechFingerprinter:
         except Exception:
             pass
 
-        # Use builtwith if available
         if BUILTWITH_AVAILABLE:
             try:
                 bw = builtwith.parse(f"https://{target}")
@@ -1046,13 +1298,6 @@ class ContentScanner:
                 timeout=Config.TIMEOUT,
                 allow_redirects=Config.FOLLOW_REDIRECTS,
             )
-        except Exception:
-            return None
-
-    def _head(self, url: str) -> Optional[requests.Response]:
-        try:
-            _rate_limiter.wait(self.target)
-            return self.session.head(url, timeout=Config.TIMEOUT, allow_redirects=True)
         except Exception:
             return None
 
@@ -1096,28 +1341,59 @@ class ContentScanner:
 
         return sorted(emails), sorted(phones)
 
-    def find_sensitive_files(self) -> list[dict]:
+    def find_sensitive_files(self, extra_paths: list = None) -> list[dict]:
+        """Tiered discovery:
+        - verifiable paths use GET + content check (no false positives)
+        - everything else uses HEAD and requires a non-HTML content-type
+        """
         found = []
+        paths = list(Config.SENSITIVE_FILES)
+        if extra_paths:
+            for p in extra_paths:
+                p = p.lstrip("/")
+                if p and p not in paths:
+                    paths.append(p)
 
-        def check_url(url: str) -> Optional[dict]:
-            r = self._head(url)
-            if r and r.status_code == 200:
-                ctype = r.headers.get("Content-Type", "")
-                size  = r.headers.get("Content-Length", "unknown")
-                return {"url": url, "status": 200, "content_type": ctype, "size": size}
+        def check_one(args) -> Optional[dict]:
+            scheme, path = args
+            url = f"{scheme}://{self.target}/{path}"
+            verifier = Config.SENSITIVE_VERIFIERS.get(path)
+            try:
+                if verifier is not None:
+                    _rate_limiter.wait(self.target)
+                    r = self.session.get(url, timeout=Config.TIMEOUT,
+                                         allow_redirects=True)
+                    if r.status_code != 200:
+                        return None
+                    ctype = r.headers.get("Content-Type", "")
+                    if soft_404(r.text, ctype):
+                        return None
+                    body = r.text
+                    if verifier(body):
+                        return {"url": url, "status": 200,
+                                "content_type": ctype,
+                                "size": r.headers.get("Content-Length", len(body))}
+                    return None
+                else:
+                    r = self.session.head(url, timeout=Config.TIMEOUT,
+                                          allow_redirects=True)
+                    if r and r.status_code == 200:
+                        ctype = r.headers.get("Content-Type", "")
+                        # A 200 HTML page is almost always a soft-404 / directory page
+                        if "html" in (ctype or "").lower():
+                            return None
+                        size = r.headers.get("Content-Length", "unknown")
+                        return {"url": url, "status": 200, "content_type": ctype, "size": size}
+            except Exception:
+                return None
             return None
 
-        urls = []
-        for scheme in ["https", "http"]:
-            for f in Config.SENSITIVE_FILES:
-                urls.append(f"{scheme}://{self.target}/{f}")
-
+        tasks = [(scheme, path) for scheme in ("https", "http") for path in paths]
         with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as pool:
-            for result in pool.map(check_url, urls):
+            for result in pool.map(check_one, tasks):
                 if result:
                     found.append(result)
 
-        # Deduplicate by path
         seen = set()
         deduped = []
         for item in found:
@@ -1131,9 +1407,14 @@ class ContentScanner:
         found = []
 
         def check_url(url: str) -> Optional[str]:
-            r = self._head(url)
-            if r and r.status_code in (200, 301, 302, 401, 403):
-                return url
+            try:
+                _rate_limiter.wait(self.target)
+                r = self.session.get(url, timeout=Config.TIMEOUT,
+                                     allow_redirects=True)
+                if r and r.status_code in (200, 301, 302, 401, 403):
+                    return url
+            except Exception:
+                pass
             return None
 
         urls = [f"{scheme}://{self.target}/{path}"
@@ -1145,7 +1426,6 @@ class ContentScanner:
                 if result:
                     found.append(result)
 
-        # Deduplicate
         seen, deduped = set(), []
         for u in found:
             k = urlparse(u).path
@@ -1157,6 +1437,26 @@ class ContentScanner:
     def get_robots_txt(self) -> str:
         r = self._get("robots.txt")
         return r.text[:3000] if r and r.status_code == 200 else ""
+
+    def parse_robots_disallow(self, robots_txt: str) -> list[str]:
+        """Extract Disallow/Allow paths from robots.txt to enrich file discovery."""
+        paths = []
+        if not robots_txt:
+            return paths
+        for line in robots_txt.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                continue
+            directive, _, value = line.partition(":")
+            directive = directive.strip().lower()
+            value = value.strip()
+            if directive in ("disallow", "allow") and value and value not in ("/", "*"):
+                p = value.split("*")[0].split("?")[0].strip("/")
+                if p and p not in paths and len(p) < 60:
+                    paths.append(p)
+        return paths[:40]
 
     def get_sitemap_urls(self) -> list[str]:
         urls = []
@@ -1170,7 +1470,8 @@ class ContentScanner:
 
 class SubdomainTakeoverDetector:
     @staticmethod
-    def check(subdomains: list[dict], session: requests.Session) -> list[dict]:
+    def check(subdomains: list[dict], session: requests.Session,
+              limit: int = Config.MAX_SUBDOMAINS_CHECK) -> list[dict]:
         vulnerable = []
         def check_one(sub_info: dict) -> Optional[dict]:
             sub = sub_info["subdomain"]
@@ -1192,7 +1493,7 @@ class SubdomainTakeoverDetector:
             return None
 
         with ThreadPoolExecutor(max_workers=15) as pool:
-            for result in pool.map(check_one, subdomains[:100]):
+            for result in pool.map(check_one, subdomains[:limit]):
                 if result:
                     vulnerable.append(result)
         return vulnerable
@@ -1277,10 +1578,10 @@ class VulnerabilityEngine:
         except Exception:
             return None
 
-    def _head(self, url: str) -> Optional[requests.Response]:
+    def _get(self, url: str) -> Optional[requests.Response]:
         try:
             _rate_limiter.wait(self.r.target)
-            return self.session.head(url, timeout=Config.TIMEOUT, allow_redirects=False)
+            return self.session.get(url, timeout=Config.TIMEOUT, allow_redirects=True)
         except Exception:
             return None
 
@@ -1290,39 +1591,45 @@ class VulnerabilityEngine:
     # ── Individual Checks ────────────────────────────────────
 
     def check_git_exposure(self):
-        r = self._check(f"http://{self.r.target}/.git/HEAD")
-        if r and r.status_code == 200 and "ref:" in r.text:
-            self._add(
-                name="Exposed .git Directory",
-                severity="High",
-                cvss=7.5,
-                description="The .git directory is publicly accessible, potentially exposing full source code, "
-                            "commit history, credentials embedded in code, and internal architecture.",
-                evidence=f"/.git/HEAD returned HTTP 200. Content: {r.text[:80]}",
-                remediation="Block access via web server config (e.g., 'deny from all' in .htaccess). "
-                            "Use git-dumper to assess exposure and rotate any leaked credentials.",
-                cwe="CWE-538",
-                references=["https://owasp.org/www-community/Source_Code_Management_Exposure"],
-            )
+        for scheme in ("http", "https"):
+            r = self._check(f"{scheme}://{self.r.target}/.git/HEAD")
+            if r and r.status_code == 200 and "ref:" in r.text:
+                self._add(
+                    name="Exposed .git Directory",
+                    severity="High",
+                    cvss=7.5,
+                    description="The .git directory is publicly accessible, potentially exposing full source code, "
+                                "commit history, credentials embedded in code, and internal architecture.",
+                    evidence=f"/.git/HEAD returned HTTP 200 via {scheme}. Content: {r.text[:80]}",
+                    remediation="Block access via web server config (e.g., 'deny from all' in .htaccess). "
+                                "Use git-dumper to assess exposure and rotate any leaked credentials.",
+                    cwe="CWE-538",
+                    references=["https://owasp.org/www-community/Source_Code_Management_Exposure"],
+                )
+                break
 
     def check_env_exposure(self):
         for path in [".env", ".env.local", ".env.production"]:
-            r = self._check(f"http://{self.r.target}/{path}")
-            if r and r.status_code == 200 and ("=" in r.text or "DB_" in r.text or "SECRET" in r.text.upper()):
-                self._add(
-                    name="Environment File Exposed",
-                    severity="Critical",
-                    cvss=9.8,
-                    description=f"The file /{path} is publicly accessible and appears to contain "
-                                "sensitive configuration including database credentials, API keys, "
-                                "and application secrets.",
-                    evidence=f"/{path} returned HTTP 200 with credential-like content",
-                    remediation="Remove the file from the web root immediately. Move secrets to a "
-                                "secrets manager (Vault, AWS Secrets Manager). Rotate ALL credentials.",
-                    cwe="CWE-200",
-                    references=["https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure"],
-                )
-                break
+            for scheme in ("http", "https"):
+                r = self._get(f"{scheme}://{self.r.target}/{path}")
+                if r and r.status_code == 200 and looks_like_env(r.text):
+                    self._add(
+                        name="Environment File Exposed",
+                        severity="Critical",
+                        cvss=9.8,
+                        description=f"The file /{path} is publicly accessible and appears to contain "
+                                    "sensitive configuration including database credentials, API keys, "
+                                    "and application secrets.",
+                        evidence=f"/{path} returned HTTP 200 via {scheme} with KEY=VALUE content",
+                        remediation="Remove the file from the web root immediately. Move secrets to a "
+                                    "secrets manager (Vault, AWS Secrets Manager). Rotate ALL credentials.",
+                        cwe="CWE-200",
+                        references=["https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure"],
+                    )
+                    break
+            else:
+                continue
+            break
 
     def check_directory_listing(self):
         test_dirs = ["images", "assets", "uploads", "static", "files", "media", "css", "js"]
@@ -1405,6 +1712,8 @@ class VulnerabilityEngine:
                     "X-Content-Type-Options":       ("Low",    3.7),
                     "Referrer-Policy":              ("Low",    3.1),
                     "Permissions-Policy":           ("Low",    2.0),
+                    "Cross-Origin-Embedder-Policy": ("Low",    2.0),
+                    "Cross-Origin-Opener-Policy":   ("Low",    2.0),
                 }
                 if header in sev_map:
                     sev, cvss = sev_map[header]
@@ -1588,6 +1897,67 @@ class VulnerabilityEngine:
             except Exception:
                 continue
 
+    def check_trace_method(self):
+        """Cross-Site Tracing (XST): TRACE enabled + request body echoed."""
+        for scheme in ("http", "https"):
+            try:
+                url = f"{scheme}://{self.r.target}/"
+                _rate_limiter.wait(self.r.target)
+                opt = self.session.request("OPTIONS", url, timeout=Config.TIMEOUT)
+                allow = opt.headers.get("Allow", "").upper()
+                if "TRACE" not in allow:
+                    return
+                _rate_limiter.wait(self.r.target)
+                tr = self.session.request("TRACE", url, timeout=Config.TIMEOUT,
+                                          data="cybersleuth-xst-probe")
+                if tr.status_code == 200 and "cybersleuth-xst-probe" in tr.text:
+                    self._add(
+                        name="HTTP TRACE Enabled (XST)",
+                        severity="Low",
+                        cvss=3.1,
+                        description="The web server allows HTTP TRACE requests, which reflect the request "
+                                    "back to the client. Combined with XSS, TRACE enables Cross-Site Tracing "
+                                    "to steal HttpOnly cookies.",
+                        evidence="OPTIONS Allow header includes TRACE and the TRACE response echoes the body",
+                        remediation="Disable the TRACE method in the web server configuration.",
+                        cwe="CWE-693",
+                    )
+                return
+            except Exception:
+                continue
+
+    def check_open_redirect(self):
+        schemes = ["https"] if self.r.http_headers else ["https", "http"]
+        tried = 0
+        for path in Config.REDIRECT_PATHS:
+            for payload in Config.REDIRECT_PAYLOADS:
+                url = f"{schemes[0]}://{self.r.target}/{path.lstrip('/')}"
+                try:
+                    q = "?" if "?" not in url else "&"
+                    _rate_limiter.wait(self.r.target)
+                    r = self.session.get(url + q + "url=" + payload + q + "next=" + payload,
+                                         timeout=Config.TIMEOUT, allow_redirects=False)
+                    if r.status_code in (301, 302, 303, 307, 308):
+                        loc = r.headers.get("Location", "")
+                        if "evil.attacker.invalid" in loc or loc.startswith("//"):
+                            self._add(
+                                name="Open Redirect",
+                                severity="Medium",
+                                cvss=4.7,
+                                description=f"The endpoint {path} reflects an attacker-controlled redirect "
+                                            f"target in the Location header.",
+                                evidence=f"GET {path} -> 30x Location: {loc[:120]}",
+                                remediation="Validate redirect targets against an allowlist of internal "
+                                            "hosts; never reflect user input into Location.",
+                                cwe="CWE-601",
+                            )
+                            return
+                    tried += 1
+                    if tried >= 8:
+                        return
+                except Exception:
+                    continue
+
     def check_email_security(self):
         if not is_valid_ip(self.r.target):
             spf = self.r.spf_record
@@ -1661,6 +2031,16 @@ class VulnerabilityEngine:
                 cwe="CWE-350",
             )
 
+    def _dedupe(self):
+        seen = set()
+        out = []
+        for v in self.vulns:
+            key = (v.name, v.evidence)
+            if key not in seen:
+                seen.add(key)
+                out.append(v)
+        self.vulns = out
+
     def run_all(self) -> list[Vulnerability]:
         checks = [
             self.check_git_exposure,
@@ -1679,10 +2059,14 @@ class VulnerabilityEngine:
             self.check_virustotal,
             self.check_subdomain_takeover,
         ]
+
+        if not Config.PASSIVE_MODE:
+            checks += [self.check_trace_method, self.check_open_redirect]
+
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(lambda fn: fn(), checks))
 
-        # Sort by CVSS score
+        self._dedupe()
         self.vulns.sort(key=lambda v: v.cvss, reverse=True)
         return self.vulns
 
@@ -1701,13 +2085,13 @@ class CyberSleuthUltra:
     def run(self, verbose: bool = False) -> ScanResults:
         console.print(Panel.fit(
             Text.assemble(
-                ("╔══════════════════════════════════════════╗\n", "bold blue"),
-                ("║   CyberSleuth Ultra v3.0                 ║\n", "bold cyan"),
-                ("║   Advanced OSINT & Vulnerability Scanner  ║\n", "bold cyan"),
-                ("╚══════════════════════════════════════════╝\n", "bold blue"),
+                (f"  CyberSleuth Ultra v{VERSION}", "bold cyan"),
+                ("  Advanced OSINT & Vulnerability Scanner", "dim"),
                 (f"\n  Target  : ", "bold"), (self.target, "bold green"),
-                (f"\n  Mode    : ", "bold"), (self.port_mode, "yellow"),
-                (f"\n  Started : ", "bold"), (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "dim"),
+                (f"\n  Mode    : ", "bold"),
+                (self.port_mode + (" (passive)" if Config.PASSIVE_MODE else ""), "yellow"),
+                (f"\n  Started : ", "bold"),
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "dim"),
             ),
             border_style="blue"
         ))
@@ -1731,6 +2115,10 @@ class CyberSleuthUltra:
                 progress.update(t, completed=1)
                 progress.update(main_task, advance=1)
                 return result
+
+            def skip(label: str):
+                progress.add_task(f"  {label} (skipped)", total=1, completed=1)
+                progress.update(main_task, advance=1)
 
             # ── 1. IP Resolution ──────────────────────────────
             try:
@@ -1764,34 +2152,47 @@ class CyberSleuthUltra:
 
             # ── 7. Subdomain Enumeration ──────────────────────
             if not is_valid_ip(self.target):
-                scanner = SubdomainScanner(self.target, self.session)
-                self.results.subdomains = step("Subdomain enumeration", scanner.scan)
+                scanner = SubdomainScanner(self.target, self.session,
+                                           allow_brute=not Config.PASSIVE_MODE)
+                subs, wildcard = step("Subdomain enumeration", scanner.scan)
+                self.results.subdomains = subs
+                self.results.wildcard_dns = wildcard
             else:
                 progress.update(main_task, advance=1)
 
             # ── 8. Port Scanning ──────────────────────────────
-            ports = (Config.TOP_100_PORTS if self.port_mode == "top100"
-                     else Config.COMMON_PORTS)
-            port_results = step("Port scanning", PortScanner.scan, ip, ports)
-            self.results.open_ports = [asdict(p) for p in port_results]
+            if Config.PASSIVE_MODE:
+                skip("Port scanning (passive mode)")
+            else:
+                ports = (Config.TOP_100_PORTS if self.port_mode == "top100"
+                         else Config.COMMON_PORTS)
+                port_results = step("Port scanning", PortScanner.scan, ip, ports, self.target)
+                self.results.open_ports = [asdict(p) for p in port_results]
 
             # ── 9. SSL/TLS Analysis ───────────────────────────
-            ssl_port = 443
-            if any(p["port"] == 443 for p in self.results.open_ports):
-                info = step("SSL/TLS analysis", SSLScanner.scan, self.target, ssl_port)
+            if Config.PASSIVE_MODE:
+                skip("SSL/TLS analysis (passive mode)")
+            elif any(p["port"] == 443 for p in self.results.open_ports):
+                info = step("SSL/TLS analysis", SSLScanner.scan, self.target, 443)
                 self.results.ssl_info = asdict(info)
             else:
                 step("SSL/TLS analysis (skipped - port 443 closed)", lambda: {})
 
             # ── 10. HTTP Headers ──────────────────────────────
-            raw_hdrs, audit = step("HTTP security headers", HTTPHeaderScanner.scan,
-                                   self.target, self.session)
-            self.results.http_headers    = raw_hdrs
-            self.results.security_headers = audit
+            if Config.PASSIVE_MODE:
+                skip("HTTP security headers (passive mode)")
+            else:
+                raw_hdrs, audit = step("HTTP security headers", HTTPHeaderScanner.scan,
+                                       self.target, self.session)
+                self.results.http_headers     = raw_hdrs
+                self.results.security_headers = audit
 
             # ── 11. WAF Detection ─────────────────────────────
-            self.results.waf_detected = step("WAF detection", WAFDetector.detect,
-                                              self.target, self.session)
+            if Config.PASSIVE_MODE:
+                skip("WAF detection (passive mode)")
+            else:
+                self.results.waf_detected = step("WAF detection", WAFDetector.detect,
+                                                  self.target, self.session)
 
             # ── 12. Technology Fingerprinting ─────────────────
             self.results.technologies = step("Technology fingerprinting",
@@ -1800,27 +2201,42 @@ class CyberSleuthUltra:
 
             # ── 13. Content Discovery ─────────────────────────
             content = ContentScanner(self.target, self.session)
-            emails, phones = step("Contact harvesting", content.harvest_contacts)
-            self.results.emails        = emails
-            self.results.phone_numbers = phones
 
-            sens_task = progress.add_task("  Sensitive file discovery", total=1)
-            self.results.sensitive_files = content.find_sensitive_files()
-            progress.update(sens_task, completed=1)
+            if Config.QUICK_MODE or Config.PASSIVE_MODE:
+                skip("Contact harvesting (skipped)")
+            else:
+                emails, phones = step("Contact harvesting", content.harvest_contacts)
+                self.results.emails        = emails
+                self.results.phone_numbers = phones
 
-            admin_task = progress.add_task("  Admin panel discovery", total=1)
-            self.results.admin_panels = content.find_admin_panels()
-            progress.update(admin_task, completed=1)
+            if Config.PASSIVE_MODE:
+                skip("Sensitive file discovery (passive mode)")
+            else:
+                robots_txt = content.get_robots_txt()
+                self.results.robots_txt = robots_txt
+                disallow = content.parse_robots_disallow(robots_txt)
+                sf_task = progress.add_task("  Sensitive file discovery", total=1)
+                self.results.sensitive_files = content.find_sensitive_files(extra_paths=disallow)
+                progress.update(sf_task, completed=1)
 
-            self.results.robots_txt    = content.get_robots_txt()
-            self.results.sitemap_urls  = content.get_sitemap_urls()
+            if Config.PASSIVE_MODE:
+                skip("Admin panel discovery (passive mode)")
+            else:
+                admin_task = progress.add_task("  Admin panel discovery", total=1)
+                self.results.admin_panels = content.find_admin_panels()
+                progress.update(admin_task, completed=1)
+
+            if not Config.QUICK_MODE and not Config.PASSIVE_MODE:
+                self.results.sitemap_urls = content.get_sitemap_urls()
+            else:
+                skip("Sitemap parsing (skipped)")
 
             # ── 14. Subdomain Takeover ────────────────────────
-            if self.results.subdomains:
+            if self.results.subdomains and not Config.PASSIVE_MODE and not Config.QUICK_MODE:
                 self.results.subdomain_takeover = step(
                     "Subdomain takeover check",
                     SubdomainTakeoverDetector.check,
-                    self.results.subdomains, self.session
+                    self.results.subdomains, self.session, Config.MAX_SUBDOMAINS_CHECK
                 )
             else:
                 progress.update(main_task, advance=1)
@@ -1844,8 +2260,10 @@ class CyberSleuthUltra:
         self.results.scan_metadata = {
             "scan_duration_seconds": round(time.time() - start, 2),
             "scan_timestamp":        datetime.now(timezone.utc).isoformat(),
-            "scanner_version":       "3.0",
+            "scanner_version":       VERSION,
             "port_mode":             self.port_mode,
+            "passive":               Config.PASSIVE_MODE,
+            "quick":                 Config.QUICK_MODE,
             "total_checks":          len(engine.vulns),
         }
 
@@ -1941,11 +2359,11 @@ class Reporter:
             port_table.add_column("Proto",   width=6)
             port_table.add_column("Service", style="cyan",   width=16)
             port_table.add_column("Risk",    width=10)
-            port_table.add_column("Banner",  style="dim",    max_width=50)
+            port_table.add_column("Banner",  style="dim",    max_width=60)
             for p in results.open_ports:
                 port = p["port"] if isinstance(p, dict) else p.port
                 svc  = p["service"] if isinstance(p, dict) else p.service
-                ban  = (p["banner"] if isinstance(p, dict) else p.banner)[:60]
+                ban  = (p["banner"] if isinstance(p, dict) else p.banner)[:80]
                 risk = "[red]HIGH[/]" if port in PortScanner.DANGEROUS_SERVICES else "[green]LOW[/]"
                 port_table.add_row(str(port), "tcp", svc, risk, ban)
             c.print(port_table)
@@ -2004,6 +2422,8 @@ class Reporter:
                     "[yellow]Yes[/]" if s.get("private") else ""
                 )
             c.print(sub_table)
+            if results.wildcard_dns:
+                c.print("[yellow][!] Wildcard DNS detected — brute-forced subdomains would be unreliable.[/]")
 
         # ── Contact Info ──────────────────────────────────────
         if results.emails or results.phone_numbers:
@@ -2099,28 +2519,45 @@ class Reporter:
         console.print(f"[green][+] JSON results saved → {filepath}[/]")
 
     @staticmethod
+    def save_csv(results: ScanResults, filepath: str):
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["target", "severity", "cvss", "name", "cwe", "evidence", "remediation"])
+            for v in results.vulnerabilities:
+                w.writerow([
+                    results.target, v.get("severity", ""), v.get("cvss", ""),
+                    v.get("name", ""), v.get("cwe", ""),
+                    v.get("evidence", ""), v.get("remediation", ""),
+                ])
+        console.print(f"[green][+] CSV results saved → {filepath}[/]")
+
+    @staticmethod
     def save_html(results: ScanResults, filepath: str):
-        """Generate a self-contained HTML report."""
-        vulns_html = ""
+        """Generate a self-contained, XSS-safe HTML report."""
         sev_colors = {
             "Critical": "#FF3B30", "High": "#FF9500",
             "Medium":   "#FFCC00", "Low":  "#34C759", "Info": "#636366"
         }
+
+        vulns_html = ""
         for vuln in results.vulnerabilities:
             color = sev_colors.get(vuln["severity"], "#999")
-            refs_html = "".join(f'<a href="{r}" target="_blank">{r}</a><br>' for r in vuln.get("references", []))
+            refs_html = "".join(
+                f'<a href="{esc(r)}" target="_blank">{esc(r)}</a><br>'
+                for r in vuln.get("references", [])
+            )
             vulns_html += f"""
             <div class="vuln">
               <div class="vuln-header" style="border-left: 5px solid {color};">
-                <span class="badge" style="background:{color}">{vuln["severity"]}</span>
-                <strong>{vuln["name"]}</strong>
-                <span class="cvss">CVSS {vuln.get("cvss",0):.1f}</span>
-                {f'<span class="cwe">{vuln.get("cwe","")}</span>' if vuln.get("cwe") else ""}
+                <span class="badge" style="background:{color}">{esc(vuln['severity'])}</span>
+                <strong>{esc(vuln['name'])}</strong>
+                <span class="cvss">CVSS {vuln.get('cvss',0):.1f}</span>
+                {f'<span class="cwe">{esc(vuln.get("cwe",""))}</span>' if vuln.get("cwe") else ""}
               </div>
               <div class="vuln-body">
-                <p><strong>Description:</strong> {vuln["description"]}</p>
-                <p><strong>Evidence:</strong> <code>{vuln.get("evidence","")}</code></p>
-                <p><strong>Remediation:</strong> <span class="fix">{vuln["remediation"]}</span></p>
+                <p><strong>Description:</strong> {esc(vuln['description'])}</p>
+                <p><strong>Evidence:</strong> <code>{esc(vuln.get('evidence',''))}</code></p>
+                <p><strong>Remediation:</strong> <span class="fix">{esc(vuln['remediation'])}</span></p>
                 {f'<p><strong>References:</strong> {refs_html}</p>' if refs_html else ""}
               </div>
             </div>"""
@@ -2130,18 +2567,105 @@ class Reporter:
             sev_count[v["severity"]] += 1
 
         ports_rows = "".join(
-            f"<tr><td>{p['port']}</td><td>tcp</td><td>{p['service']}</td>"
+            f"<tr><td>{p['port']}</td><td>tcp</td><td>{esc(p['service'])}</td>"
             f"<td>{'<span class=\"high\">HIGH</span>' if p['port'] in PortScanner.DANGEROUS_SERVICES else '<span class=\"low\">LOW</span>'}</td>"
-            f"<td>{p.get('banner','')[:80]}</td></tr>"
+            f"<td>{esc(p.get('banner',''))[:120]}</td></tr>"
             for p in results.open_ports
         )
+
+        # ── Extra sections ─────────────────────────────────────
+        dns_rows = ""
+        if results.dns_records:
+            dns_rows = "".join(
+                f"<tr><td>{esc(rtype)}</td><td>{esc(', '.join(v) if isinstance(v, list) else v)}</td></tr>"
+                for rtype, v in results.dns_records.items()
+                if rtype != "zone_transfer_vulnerable"
+            )
+            if results.dns_records.get("zone_transfer_vulnerable"):
+                dns_rows += (f"<tr><td style='color:#FF9500;font-weight:700'>Zone Transfer</td>"
+                             f"<td style='color:#FF9500'>VULNERABLE via {esc(results.dns_records.get('zone_transfer_ns',''))}</td></tr>")
+
+        hdr_rows = "".join(
+            f"<tr><td>{esc(h)}</td><td>{'<span class=\"good\">✓ Secure</span>' if a.get('secure') else '<span class=\"warn\">⚠ Present</span>' if a.get('present') else '<span class=\"bad\">✗ Missing</span>'}</td>"
+            f"<td>{esc(HTTPHeaderScanner.SECURITY_HEADERS.get(h,{}).get('desc',''))}</td></tr>"
+            for h, a in results.security_headers.items()
+        )
+
+        tech_html = ""
+        if results.technologies:
+            tech_html = "<h2>Technology Stack</h2><p>" + "<br>".join(
+                f"<strong>{esc(cat.title())}:</strong> {esc(', '.join(items))}"
+                for cat, items in results.technologies.items() if items
+            ) + "</p>"
+
+        subs_rows = "".join(
+            f'<tr><td>{esc(s["subdomain"])}</td><td>{esc(s["ip"])}</td></tr>'
+            for s in results.subdomains[:100]
+        )
+
+        files_rows = "".join(
+            f'<tr><td>{esc(f["url"])}</td><td>{esc(f.get("content_type",""))}</td><td>{esc(f.get("size",""))}</td></tr>'
+            for f in results.sensitive_files
+        )
+
+        email_rows = ""
+        if any([results.spf_record, results.dkim_record, results.dmarc_record]):
+            email_rows = "".join(
+                f'<tr><td>{k}</td><td>{esc(v or "NOT FOUND")}</td></tr>'
+                for k, v in [("SPF", results.spf_record), ("DKIM", results.dkim_record),
+                             ("DMARC", results.dmarc_record)]
+            )
+
+        asn = results.asn_info
+        overview_html = (
+            f"<tr><td>Target</td><td>{esc(results.target)}</td></tr>"
+            f"<tr><td>IP Address</td><td>{esc(results.ip_address)}</td></tr>"
+            f"<tr><td>ASN</td><td>{esc(asn.get('asn',''))} — {esc(asn.get('description',''))}</td></tr>"
+            f"<tr><td>Network</td><td>{esc(asn.get('prefix','N/A'))}</td></tr>"
+            f"<tr><td>Country/RIR</td><td>{esc(asn.get('cc','?'))} / {esc(asn.get('rir','?'))}</td></tr>"
+            f"<tr><td>WAF</td><td>{esc(results.waf_detected or 'None detected')}</td></tr>"
+        )
+
+        admin_html = ""
+        if results.admin_panels:
+            admin_html = "<h2>Admin Panels</h2><p>" + "<br>".join(
+                f"→ {esc(p)}" for p in results.admin_panels
+            ) + "</p>"
+
+        takeover_rows = ""
+        if results.subdomain_takeover:
+            takeover_rows = "".join(
+                f'<tr><td>{esc(v["subdomain"])}</td><td>{esc(v["service"])}</td><td>{esc(v["fingerprint"])}</td></tr>'
+                for v in results.subdomain_takeover
+            )
+
+        shodan_html = ""
+        if results.shodan_data and "error" not in results.shodan_data:
+            sh = results.shodan_data
+            shodan_html = (
+                "<h2>Shodan Intelligence</h2><p>"
+                f"Org: {esc(sh.get('org',''))} | OS: {esc(sh.get('os','Unknown'))} | "
+                f"Location: {esc(sh.get('city',''))}, {esc(sh.get('country',''))} | "
+                f"Open Ports: {esc(', '.join(str(p) for p in sh.get('ports',[])))} | "
+                f"Tags: {esc(', '.join(sh.get('tags',[])))}"
+                + (f" | <span style='color:#FF9500;font-weight:700'>CVEs: {esc(', '.join(sh['vulns'][:10]))}</span>"
+                   if sh.get("vulns") else "")
+                + "</p>"
+            )
+
+        vt_html = ""
+        if results.virustotal_data and "error" not in results.virustotal_data:
+            vt = results.virustotal_data
+            vt_html = (f"<h2>VirusTotal</h2><p>Malicious: <span style='color:#FF3B30'>{vt.get('malicious',0)}</span> | "
+                       f"Suspicious: {vt.get('suspicious',0)} | Harmless: {vt.get('harmless',0)} | "
+                       f"Reputation: {vt.get('reputation','N/A')}</p>")
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CyberSleuth Ultra Report — {results.target}</title>
+<title>CyberSleuth Ultra Report — {esc(results.target)}</title>
 <style>
   :root {{
     --bg: #0d1117; --surface: #161b22; --border: #30363d;
@@ -2171,6 +2695,7 @@ class Reporter:
   .cvss {{ margin-left:auto; color:var(--dim); font-size:.8rem; }}
   .cwe {{ color:var(--dim); font-size:.8rem; }}
   .fix {{ color: #3fb950; }}
+  .good {{ color:#3fb950; }} .warn {{ color:#FFCC00; }} .bad {{ color:#FF9500; }}
   code {{ background:#1c2128; padding:.1rem .4rem; border-radius:4px; font-size:.85rem; }}
   table {{ width:100%; border-collapse:collapse; background:var(--surface);
            border:1px solid var(--border); border-radius:8px; overflow:hidden; }}
@@ -2184,12 +2709,15 @@ class Reporter:
 </style>
 </head>
 <body>
-<h1>🔍 CyberSleuth Ultra v3.0 — Security Report</h1>
+<h1>🔍 CyberSleuth Ultra v{VERSION} — Security Report</h1>
 <p class="meta">
-  Target: <strong>{results.target}</strong> ({results.ip_address}) |
-  Scanned: {results.scan_metadata.get("scan_timestamp","")[:19]} |
-  Duration: {results.scan_metadata.get("scan_duration_seconds","?")}s
+  Target: <strong>{esc(results.target)}</strong> ({esc(results.ip_address)}) |
+  Scanned: {esc(results.scan_metadata.get("scan_timestamp",""))[:19]} |
+  Duration: {esc(results.scan_metadata.get("scan_duration_seconds","?"))}s
 </p>
+
+<h2>Target Overview</h2>
+<table>{overview_html}</table>
 
 <h2>Vulnerability Summary</h2>
 <div class="summary">
@@ -2212,14 +2740,38 @@ class Reporter:
   {ports_rows if ports_rows else '<tr><td colspan="5" style="color:var(--dim)">No open ports detected.</td></tr>'}
 </table>
 
+<h2>DNS Records</h2>
+<table>
+  <tr><th>Type</th><th>Value</th></tr>
+  {dns_rows if dns_rows else '<tr><td colspan="2" style="color:var(--dim)">No DNS records.</td></tr>'}
+</table>
+
+<h2>Security Headers</h2>
+<table>
+  <tr><th>Header</th><th>Status</th><th>Purpose</th></tr>
+  {hdr_rows if hdr_rows else '<tr><td colspan="3" style="color:var(--dim)">No header audit.</td></tr>'}
+</table>
+
+{tech_html}
+
 <h2>Subdomains ({len(results.subdomains)} Found)</h2>
 <table>
   <tr><th>Subdomain</th><th>IP</th></tr>
-  {"".join(f'<tr><td>{s["subdomain"]}</td><td>{s["ip"]}</td></tr>' for s in results.subdomains[:100])
-   or '<tr><td colspan="2" style="color:var(--dim)">No subdomains found.</td></tr>'}
+  {subs_rows or '<tr><td colspan="2" style="color:var(--dim)">No subdomains found.</td></tr>'}
 </table>
+{f'<p class="meta">Wildcard DNS: yes — brute-forced subdomains unreliable</p>' if results.wildcard_dns else ''}
 
-{'<h2>Sensitive Files (' + str(len(results.sensitive_files)) + ' Found)</h2><table><tr><th>URL</th><th>Type</th><th>Size</th></tr>' + "".join(f'<tr><td>{f["url"]}</td><td>{f.get("content_type","")}</td><td>{f.get("size","")}</td></tr>' for f in results.sensitive_files) + '</table>' if results.sensitive_files else ''}
+{'<h2>Email Security (SPF/DKIM/DMARC)</h2><table><tr><th>Type</th><th>Record</th></tr>' + email_rows + '</table>' if email_rows else ''}
+
+{'<h2>Sensitive Files (' + str(len(results.sensitive_files)) + ' Found)</h2><table><tr><th>URL</th><th>Type</th><th>Size</th></tr>' + files_rows + '</table>' if results.sensitive_files else ''}
+
+{admin_html}
+
+{'<h2>Subdomain Takeover (' + str(len(results.subdomain_takeover)) + ' Candidates)</h2><table><tr><th>Subdomain</th><th>Service</th><th>Fingerprint</th></tr>' + takeover_rows + '</table>' if results.subdomain_takeover else ''}
+
+{shodan_html}
+
+{vt_html}
 
 <div class="disclaimer">
   ⚠ This report is intended for authorized security testing only.
@@ -2240,14 +2792,17 @@ class Reporter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CyberSleuth Ultra v3.0 — Advanced OSINT & Vulnerability Scanner",
+        description=f"CyberSleuth Ultra v{VERSION} — Advanced OSINT & Vulnerability Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python cybersleuth_ultra.py example.com
   python cybersleuth_ultra.py example.com --ports top100 --output report
   python cybersleuth_ultra.py 93.184.216.34 --ports common
-  
+  python cybersleuth_ultra.py example.com --passive            # DNS/WHOIS/RDAP/subdomains only
+  python cybersleuth_ultra.py example.com --quick              # skip heavy checks
+  python cybersleuth_ultra.py example.com --threads 50 --timeout 10
+
 API Keys (set as environment variables):
   export SHODAN_API_KEY=your_key_here
   export VIRUSTOTAL_API_KEY=your_key_here
@@ -2260,26 +2815,41 @@ API Keys (set as environment variables):
                         default="common",
                         help="Port scan profile (default: common)")
     parser.add_argument("--output", metavar="BASENAME",
-                        help="Save results to BASENAME.json and BASENAME.html")
+                        help="Save results to BASENAME.json / .html / .csv")
     parser.add_argument("--json-only", action="store_true",
                         help="Skip HTML report generation")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable verbose logging")
+    parser.add_argument("--passive", action="store_true",
+                        help="Passive-only scan (DNS, WHOIS, RDAP, subdomains via passive "
+                             "sources, Shodan/VT). No active requests to the target.")
+    parser.add_argument("--quick", action="store_true",
+                        help="Skip heavy checks (contacts crawl, takeover, sitemap, brute-force subs)")
+    parser.add_argument("--threads", type=int, default=30,
+                        help="Max concurrent workers (default: 30)")
+    parser.add_argument("--timeout", type=int, default=8,
+                        help="Request timeout in seconds (default: 8)")
+    parser.add_argument("--max-subdomains", type=int, default=100,
+                        help="Max subdomains to test for takeover (default: 100)")
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger("cybersleuth").setLevel(logging.DEBUG)
 
-    # Run scan
+    Config.MAX_WORKERS = max(1, args.threads)
+    Config.TIMEOUT = max(1, args.timeout)
+    Config.PASSIVE_MODE = args.passive
+    Config.QUICK_MODE = args.quick
+    Config.MAX_SUBDOMAINS_CHECK = max(1, args.max_subdomains)
+
     scanner = CyberSleuthUltra(target=args.target, port_mode=args.ports)
     results = scanner.run(verbose=args.verbose)
 
-    # Print to terminal
     Reporter.print_results(results)
 
-    # Save outputs
     if args.output:
         Reporter.save_json(results, f"{args.output}.json")
+        Reporter.save_csv(results, f"{args.output}.csv")
         if not args.json_only:
             Reporter.save_html(results, f"{args.output}.html")
 
