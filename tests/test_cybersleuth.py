@@ -9,7 +9,7 @@ from cybersleuth_ultra import (
     Config, VulnerabilityEngine, ScanResults, PortScanner,
     sanitize_target, cvss_to_severity, severity_color,
     is_valid_ip, is_private_ip, is_html, looks_like_env, soft_404,
-    esc, ContentScanner, SubdomainScanner,
+    esc, ContentScanner, SubdomainScanner, NmapScanner,
 )
 from dataclasses import dataclass, field
 
@@ -118,6 +118,50 @@ class TestConfig:
 
     def test_waf_signatures_nonempty(self):
         assert len(Config.WAF_SIGNATURES) >= 10
+
+    def test_top1000_ports_valid(self):
+        ports = Config.TOP_1000_PORTS
+        assert len(ports) == 1000
+        assert len(set(ports)) == 1000
+        assert all(1 <= p <= 65535 for p in ports)
+
+
+# ── nmap XML parsing ────────────────────────────────────────────
+
+class TestNmapParser:
+    SAMPLE = """<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="1.2.3.4" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="nginx" version="1.24.0" extrainfo="gzip"/>
+      </port>
+      <port protocol="tcp" portid="22">
+        <state state="closed"/>
+        <service name="ssh"/>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+        <service name="https"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"""
+
+    def test_parses_open_ports_with_service_details(self):
+        out = NmapScanner._parse_xml(self.SAMPLE)
+        assert [p.port for p in out] == [80, 443]
+        assert out[0].service == "http"
+        assert "nginx" in out[0].banner and "1.24.0" in out[0].banner
+
+    def test_skips_closed_ports(self):
+        out = NmapScanner._parse_xml(self.SAMPLE)
+        assert all(p.port != 22 for p in out)
+
+    def test_bad_xml_returns_empty(self):
+        assert NmapScanner._parse_xml("<not-xml") == []
 
     def test_sensitive_verifiers_keyed_to_files(self):
         for path in Config.SENSITIVE_VERIFIERS:

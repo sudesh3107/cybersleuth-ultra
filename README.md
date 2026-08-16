@@ -45,7 +45,7 @@ v3.0 had accuracy problems that are fixed here:
 |--------|-----------|
 | 🌐 DNS | Full record enumeration (A, AAAA, MX, NS, TXT, CAA, DNSSEC, Zone Transfer test) |
 | 🔎 Subdomains | Brute-force (wildcard-aware) + **crt.sh** + HackerTarget + **Wayback Machine** |
-| 🚪 Ports | Common / Top-100 profiles with real banner grabbing (TLS-aware) and risk classification |
+| 🚪 Ports | Common / Top-100 / **Top-1000** / **Full (65535)** profiles with real banner grabbing (TLS-aware), **optional nmap `-sV` integration**, and risk classification |
 | 🔒 SSL/TLS | Grade A–F, expiry, SANs, weak ciphers, TLS version |
 | 🛡️ Headers | 9-point security header audit with per-header remediation |
 | 🧱 WAF | Detects 13 WAF vendors (Cloudflare, Akamai, Imperva, AWS WAF, etc.) |
@@ -89,8 +89,14 @@ Free keys available at [shodan.io](https://shodan.io) and [virustotal.com](https
 # Basic scan
 python3 cybersleuth_ultra.py example.com
 
-# Full scan with top 100 ports, save JSON + HTML + CSV report
-python3 cybersleuth_ultra.py example.com --ports top100 --output report
+# Top 1000 ports, save JSON + HTML + CSV report
+python3 cybersleuth_ultra.py example.com --ports top1000 --output report
+
+# All 65535 ports (slow — use more threads)
+python3 cybersleuth_ultra.py example.com --ports full --threads 200
+
+# Use nmap for service/version detection (falls back to built-in scanner)
+python3 cybersleuth_ultra.py example.com --nmap
 
 # Scan an IP address
 python3 cybersleuth_ultra.py 93.184.216.34 --ports common
@@ -110,8 +116,11 @@ python3 cybersleuth_ultra.py example.com --threads 50 --timeout 10 --max-subdoma
 | Argument | Description |
 |----------|-------------|
 | `target` | Domain or IP address to scan |
-| `--ports common` | Scan ~25 most common ports (default) |
+| `--ports common` | Scan ~20 most common ports (default) |
 | `--ports top100` | Scan top 100 service ports |
+| `--ports top1000` | Scan top 1000 TCP ports (from nmap's frequency data) |
+| `--ports full` | Scan all 65535 TCP ports (slow — raise `--threads`) |
+| `--nmap` | Use the nmap binary (`-sV`, service/version detection) when installed; falls back to the built-in scanner |
 | `--output BASENAME` | Save `BASENAME.json`, `BASENAME.csv` and `BASENAME.html` |
 | `--json-only` | Skip HTML report |
 | `--passive` | Passive-only: DNS, WHOIS, RDAP, subdomains (crt.sh/HackerTarget/Wayback), Shodan, VirusTotal — no active requests to the target |
