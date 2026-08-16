@@ -151,6 +151,20 @@ nikto -h 192.168.1.100 -p 80 -C all -output nikto_report.html
 python3 exploit_integration.py --scan my_scan.json --yes
 ```
 
+The generated plan adapts to what the scan found. Tools used:
+
+| Category | Tools |
+|---|---|
+| Web vuln scanners | `sqlmap`, `nikto`, `nuclei`, `wapiti` |
+| Version → exploits | `searchsploit` (auto-extracts Apache/nginx/OpenSSH/IIS/Tomcat/PHP/... versions from banners) |
+| Fingerprinting | `whatweb` (aggressive `-a 3`) |
+| TLS audit | `testssl.sh`, `sslscan` (only when TLS ports are open) |
+| DNS recon | `dnsrecon`, `dnsenum` (only for hostnames) |
+| Content discovery | `gobuster`, `ffuf` (dir + virtual-host fuzzing; extra pass near admin panels) |
+| CMS scanners | `wpscan`, `joomscan`, `droopescan`, `magescan` (only when a CMS was detected) |
+| SMB tooling | `nmap --script smb-vuln-*`, `smbmap`, `nxc` (only when 139/445 are open) |
+| Exploitation | `metasploit` (auto-generated `.rc`), `hydra`, `redis-cli`, `mongosh`, `mysql`, `psql`, `nc` |
+
 ---
 
 ## Tests
